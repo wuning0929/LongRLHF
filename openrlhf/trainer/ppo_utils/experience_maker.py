@@ -13,6 +13,8 @@ from openrlhf.models.actor import Actor
 from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean, unpacking_samples
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.remote_rm_utils import remote_rm_fn, remote_rm_fn_ray
+from math_utils import last_boxed_only_string, remove_boxed, get_unnormalized_answer, normalize_final_answer, is_equiv, hendrycks_is_equiv
+
 
 logger = init_logger(__name__)
 
@@ -114,6 +116,7 @@ class Samples:
     packed_seq_lens: Optional[torch.Tensor]
     response_length: torch.Tensor
     total_length: torch.Tensor
+    label: str
 
 
 class NaiveExperienceMaker(ABC):
@@ -169,7 +172,7 @@ class NaiveExperienceMaker(ABC):
         return {k: v.to(device) for k, v in batch.items()}
 
     @torch.no_grad()
-    def make_experience_list(self, all_prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience]:
+    def make_experience_list(self, all_prompts: Union[str, List[str], List[List[str]]], **generate_kwargs) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
 
@@ -179,12 +182,22 @@ class NaiveExperienceMaker(ABC):
         """
         args = self.strategy.args
         experiences = []
-        for samples in tqdm(
-            self.generate_samples(all_prompts, **generate_kwargs),
-            desc="make_experience",
-            disable=not self.strategy.is_rank_0(),
-        ):
-            experiences.append(self.make_experience(samples))
+
+        if not self.strategy.apply_rlvr:
+            for samples in tqdm(
+                self.generate_samples(all_prompts, **generate_kwargs),
+                desc="make_experience",
+                disable=not self.strategy.is_rank_0(),
+            ):
+                experiences.append(self.make_experience(samples))
+        else:
+            for samples in tqdm(
+                self.generate_samples_rlvr(all_prompts, **generate_kwargs),
+                desc="make_experience",
+                disable=not self.strategy.is_rank_0(),
+            ):
+                experiences.append(self.make_experience(samples))
+
 
         experiences, rewards = self.process_experiences(experiences)
 
@@ -231,8 +244,40 @@ class NaiveExperienceMaker(ABC):
             del experience.info["num_actions"]
         return experiences
 
+
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], **generate_kwargs) -> List[Samples]:
+    def generate_samples_rlvr(self, all_prompts: Union[str, List[str], List[List[str]]], **generate_kwargs) -> List[Samples]:
+        """
+        Generate samples and return in batches.
+        """
+        assert not getattr(self, "packing_samples", False)
+        args = self.strategy.args
+        self.actor.eval()
+        # sample multiple response
+        all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
+        samples_list = []
+        for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
+            prompts = all_prompts[i : i + args.micro_rollout_batch_size]
+            prompts_str = [item[0] for item in prompts]
+            labels = [item[1] for item in prompts]
+            inputs = self.tokenize_fn(prompts_str, self.prompt_max_len, device="cuda")
+            sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
+            samples = Samples(
+                sequences=sequences,
+                attention_mask=attention_mask,
+                action_mask=action_mask,
+                num_actions=action_mask.size(1),
+                packed_seq_lens=None,
+                response_length=action_mask.float().sum(dim=-1),
+                total_length=attention_mask.float().sum(dim=-1),
+                label=labels,
+            )
+            samples_list.append(samples)
+        return samples_list
+
+
+    @torch.no_grad()
+    def generate_samples(self, all_prompts: Union[str, List[str], List[List[str]]], **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
         """
@@ -488,6 +533,49 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         return self._generate_vllm(all_prompts, **generate_kwargs)
 
+
+    def verify_math_sample(self, model_output, ground_truth_answer):
+        model_output = model_output.split("<|assistant|>\n")[-1].strip()
+        raw_answer = model_output
+        # for math, more complex. We will try a few different ways to extract the answer.
+        # this roughly follows 'flex em' in oe-eval-internal
+        all_answers = []
+        # First, try find answer in \boxed{}.
+        boxed_answer = last_boxed_only_string(raw_answer)
+        if boxed_answer is not None:
+            try:
+                boxed_answer = remove_boxed(boxed_answer)
+            except AssertionError:
+                boxed_answer = None
+        if boxed_answer is not None:
+            all_answers.append(boxed_answer)
+        # Second, try to extract via minerva format.
+        minerva_answer = normalize_final_answer(get_unnormalized_answer(raw_answer))
+        if minerva_answer is not None and minerva_answer != "[invalidanswer]":
+            all_answers.append(minerva_answer)
+        # If nothing still, try to find the last latex-formatted answer
+        if len(all_answers) == 0:
+            dollars = [m.start() for m in re.finditer("\\$", raw_answer)]
+            if len(dollars) > 1:
+                # Add the answer between the second to last and last dollar sign
+                answer = normalize_final_answer(raw_answer[dollars[-2] + 1 : dollars[-1]])
+                all_answers.append(answer)
+        # otherwise, just take the full output. Probably wont work, bit of a yolo.
+        if len(all_answers) == 0:
+            all_answers.append(normalize_final_answer(model_output))
+        # now, compare all answers to ground truth.
+        matched = False
+        for answer in all_answers:
+            if is_equiv(answer, ground_truth_answer):
+                matched = True
+                break
+            elif hendrycks_is_equiv(answer, ground_truth_answer):
+                matched = True
+                break
+        # if we got any match, we are good.
+        return matched
+
+
     @torch.no_grad()
     def make_experience(self, samples: Samples) -> Experience:
         """
@@ -498,6 +586,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         # extract values from samples
         sequences = samples.sequences
+        labels = samples.labels
+        
         attention_mask = samples.attention_mask
         action_mask = samples.action_mask
         num_actions = samples.num_actions
@@ -536,6 +626,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         if not self.remote_rm_url:
             for rm in self.reward_model:
                 r_refs.append(rm.forward.remote(sequences_cpu, attention_mask_cpu, packed_seq_lens=packed_seq_lens))
+        else if self.enable_rlvr:
+            for sequence, label in zip(zequences_cpu, labels):
+                r_refs.append(verify_math_sample(sequence, label))
         else:
             # remote RM
             for rm in self.remote_rm_url:
