@@ -1,19 +1,19 @@
 set -x
 
 ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json='{"working_dir": "/openrlhf"}' \
+   --runtime-env-json='{"working_dir": "/home/aiscuser/code/OpenRLHF"}' \
    -- python3 -m openrlhf.cli.train_rlvr_ray \
    --ref_num_nodes 1 \
    --ref_num_gpus_per_node 1 \
    --reward_num_nodes 1 \
    --reward_num_gpus_per_node 1 \
    --actor_num_nodes 1 \
-   --actor_num_gpus_per_node 4 \
+   --actor_num_gpus_per_node 1 \
    --vllm_num_engines 2 \
    --vllm_tensor_parallel_size 1 \
-   --pretrain OpenRLHF/Llama-3-8b-sft-mixture \
-   --reward_pretrain OpenRLHF/Llama-3-8b-rm-700k \
-   --save_path /openrlhf/examples/test_scripts/checkpoint/llama3-8b-rlhf \
+   --pretrain /home/aiscuser/qwen/Qwen2.5-7B-Instruct/ \
+   --reward_pretrain /home/aiscuser/qwen/Qwen2.5-7B-Instruct/ \
+   --save_path /home/aiscuser/qwen/checkpoint/llama3-8b-rlhf \
    --micro_train_batch_size 8 \
    --train_batch_size 128 \
    --micro_rollout_batch_size 32 \
@@ -35,8 +35,11 @@ ray job submit --address="http://127.0.0.1:8265" \
    --normalize_reward \
    --adam_offload \
    --gradient_checkpointing \
-   --packing_samples \
    --save_steps -1 \
-   --ckpt_path /openrlhf/examples/test_scripts/ckpt/llama3-8b-rlhf
+   --ckpt_path openrlhf/examples/test_scripts/ckpt/llama3-8b-rlhf \
+   --remote_rm_url 127.0.0.1 \
+   --colocate_actor_ref \
+   --apply_rlvr
 
 # also supports --advantage_estimator rloo
+

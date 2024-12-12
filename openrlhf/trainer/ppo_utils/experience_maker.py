@@ -3,6 +3,7 @@ from abc import ABC
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+import re
 
 import ray
 import torch
@@ -13,7 +14,7 @@ from openrlhf.models.actor import Actor
 from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean, unpacking_samples
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.remote_rm_utils import remote_rm_fn, remote_rm_fn_ray
-from math_utils import last_boxed_only_string, remove_boxed, get_unnormalized_answer, normalize_final_answer, is_equiv, hendrycks_is_equiv
+from openrlhf.trainer.ppo_utils.math_utils import last_boxed_only_string, remove_boxed, get_unnormalized_answer, normalize_final_answer, is_equiv, hendrycks_is_equiv
 
 
 logger = init_logger(__name__)
@@ -116,7 +117,7 @@ class Samples:
     packed_seq_lens: Optional[torch.Tensor]
     response_length: torch.Tensor
     total_length: torch.Tensor
-    label: str
+    labels: List[str]
 
 
 class NaiveExperienceMaker(ABC):
@@ -182,14 +183,14 @@ class NaiveExperienceMaker(ABC):
         """
         args = self.strategy.args
         experiences = []
-
-        if not self.strategy.apply_rlvr:
+        if not args.apply_rlvr:
             for samples in tqdm(
                 self.generate_samples(all_prompts, **generate_kwargs),
                 desc="make_experience",
                 disable=not self.strategy.is_rank_0(),
             ):
                 experiences.append(self.make_experience(samples))
+
         else:
             for samples in tqdm(
                 self.generate_samples_rlvr(all_prompts, **generate_kwargs),
@@ -270,7 +271,7 @@ class NaiveExperienceMaker(ABC):
                 packed_seq_lens=None,
                 response_length=action_mask.float().sum(dim=-1),
                 total_length=attention_mask.float().sum(dim=-1),
-                label=labels,
+                labels=labels,
             )
             samples_list.append(samples)
         return samples_list
@@ -564,15 +565,16 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         if len(all_answers) == 0:
             all_answers.append(normalize_final_answer(model_output))
         # now, compare all answers to ground truth.
-        matched = False
+        matched = 0
         for answer in all_answers:
             if is_equiv(answer, ground_truth_answer):
-                matched = True
+                matched = 1
                 break
             elif hendrycks_is_equiv(answer, ground_truth_answer):
-                matched = True
+                matched = 1
                 break
         # if we got any match, we are good.
+
         return matched
 
 
@@ -603,7 +605,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         base_action_log_probs_ref = self.initial_model.forward.remote(
             sequences_cpu, num_actions, attention_mask_cpu, packed_seq_lens=packed_seq_lens
         )
-
         # values
         if self.critic is not None:
             value_ref = self.critic.forward.remote(
@@ -626,9 +627,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         if not self.remote_rm_url:
             for rm in self.reward_model:
                 r_refs.append(rm.forward.remote(sequences_cpu, attention_mask_cpu, packed_seq_lens=packed_seq_lens))
-        else if self.enable_rlvr:
-            for sequence, label in zip(zequences_cpu, labels):
-                r_refs.append(verify_math_sample(sequence, label))
+        elif self.strategy.args.apply_rlvr:
+            for sequence, label in zip(sequences_cpu, labels):
+                sequence_str = "".join(self.tokenizer.batch_decode(sequence, skip_special_tokens=False))
+                r_refs.append(self.verify_math_sample(sequence_str, label))
         else:
             # remote RM
             for rm in self.remote_rm_url:
@@ -653,15 +655,15 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         # wait initial/critic/reward model done
         start = time.time()
-        ref_values = ray.get([base_action_log_probs_ref, value_ref] + r_refs)
+        ref_values = ray.get([base_action_log_probs_ref, value_ref])
         wait_time = time.time() - start
 
-        base_action_log_probs, value, rewards = ref_values[0], ref_values[1], ref_values[2:]
+        base_action_log_probs, value = ref_values[0], ref_values[1]
         base_action_log_probs = base_action_log_probs.to(device)
         if value is not None:
             value = value.to(device)
-        rewards = [r.to(device) for r in rewards]
-        r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
+        rewards = r_refs#[r.to(device) for r in r_refs]
+#        r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
 
         # avoid CUDA OOM when colocate models
         if self.strategy.args.colocate_critic_reward and not self.remote_rm_url:
@@ -693,7 +695,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         info = {
             "kl": kl_mean,
-            "reward": r,
+            "reward": rewards,
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
