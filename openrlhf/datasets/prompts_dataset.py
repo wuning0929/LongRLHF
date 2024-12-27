@@ -3,16 +3,17 @@ from tqdm import tqdm
 
 
 def preprocess_data(data, input_template=None, input_key="input", apply_chat_template=None, apply_rlvr=None) -> list:
-    if apply_chat_template:
+    if apply_rlvr:
+        chat = data[input_key]
+        if isinstance(chat, str):
+            chat = [{"role": "user", "content": chat}]
+        prompt = [apply_chat_template(chat, tokenize=False, add_generation_prompt=True) + "<LABEL>" + data["label"]]
+
+    elif apply_chat_template:
         chat = data[input_key]
         if isinstance(chat, str):
             chat = [{"role": "user", "content": chat}]
         prompt = [apply_chat_template(chat, tokenize=False, add_generation_prompt=True)]
-    elif apply_rlvr:
-        prompt = [data[input_key]]
-        if input_template:
-            prompt = [input_template.format(prompt[0])]
-        prompt.append(data["label"])
     else:
         prompt = [data[input_key]]
         if input_template:
@@ -46,7 +47,7 @@ class PromptDataset(Dataset):
         input_key = getattr(self.strategy.args, "input_key", None)
         apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
         apply_rlvr = getattr(self.strategy.args, "apply_rlvr", False)
-
+        print("apply_rlvr1:", apply_rlvr)
 
         if apply_chat_template:
             apply_chat_template = self.tokenizer.apply_chat_template
@@ -54,10 +55,7 @@ class PromptDataset(Dataset):
         self.prompts = []
         for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
             prompt = preprocess_data(data, input_template, input_key, apply_chat_template, apply_rlvr)
-            if apply_rlvr:
-                self.prompts.append(prompt)
-            else:
-                self.prompts.append(prompt[0])
+            self.prompts.append(prompt)
 
     def __len__(self):
         length = len(self.prompts)

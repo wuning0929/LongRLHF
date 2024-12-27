@@ -256,11 +256,12 @@ class NaiveExperienceMaker(ABC):
         self.actor.eval()
         # sample multiple response
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
+        all_prompts = all_prompts[0]
         samples_list = []
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
             prompts = all_prompts[i : i + args.micro_rollout_batch_size]
-            prompts_str = [item[0] for item in prompts]
-            labels = [item[1] for item in prompts]
+            prompts_str = [item.split("<LABEL>")[0] for item in prompts]
+            labels = [item.split("<LABEL>")[1] for item in prompts]
             inputs = self.tokenize_fn(prompts_str, self.prompt_max_len, device="cuda")
             sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
             samples = Samples(
@@ -321,7 +322,7 @@ class NaiveExperienceMaker(ABC):
         attention_mask = samples.attention_mask
         action_mask = samples.action_mask
         num_actions = samples.num_actions
-
+        print("naive experiencer")
         # log probs
         action_log_probs = self.actor(sequences, num_actions, attention_mask)
 
@@ -624,12 +625,16 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # rewards
         r_refs = []
         # support remote RM API with ray
+
         if not self.remote_rm_url:
             for rm in self.reward_model:
                 r_refs.append(rm.forward.remote(sequences_cpu, attention_mask_cpu, packed_seq_lens=packed_seq_lens))
         elif self.strategy.args.apply_rlvr:
             for sequence, label in zip(sequences_cpu, labels):
                 sequence_str = "".join(self.tokenizer.batch_decode(sequence, skip_special_tokens=False))
+                print("sequence_str:", sequence_str)
+                print("label:", label)
+
                 r_refs.append(self.verify_math_sample(sequence_str, label))
         else:
             # remote RM
@@ -662,9 +667,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         base_action_log_probs = base_action_log_probs.to(device)
         if value is not None:
             value = value.to(device)
-        rewards = r_refs#[r.to(device) for r in r_refs]
+        rewards = torch.tensor(r_refs, dtype=torch.float).to(device)#[r.to(device) for r in r_refs]
 #        r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
-
+        print("rewards:")
+        print(rewards)
         # avoid CUDA OOM when colocate models
         if self.strategy.args.colocate_critic_reward and not self.remote_rm_url:
             ray.get([self.reward_model[0].empty_cache.remote()])

@@ -4,11 +4,11 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{"working_dir": "/home/aiscuser/code/OpenRLHF"}' \
    -- python3 -m openrlhf.cli.train_rlvr_ray \
    --ref_num_nodes 1 \
-   --ref_num_gpus_per_node 1 \
+   --ref_num_gpus_per_node 2 \
    --reward_num_nodes 1 \
    --reward_num_gpus_per_node 1 \
    --actor_num_nodes 1 \
-   --actor_num_gpus_per_node 1 \
+   --actor_num_gpus_per_node 2 \
    --vllm_num_engines 2 \
    --vllm_tensor_parallel_size 1 \
    --pretrain /home/aiscuser/qwen/Qwen2.5-7B-Instruct/ \
@@ -29,7 +29,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --actor_learning_rate 5e-7 \
    --critic_learning_rate 9e-6 \
    --init_kl_coef 0.01 \
-   --prompt_data OpenRLHF/prompt-collection-v0.1 \
+   --prompt_data /home/aiscuser/code/OpenRLHF/data/math_prompt_v0 \
    --input_key context_messages \
    --apply_chat_template \
    --normalize_reward \
